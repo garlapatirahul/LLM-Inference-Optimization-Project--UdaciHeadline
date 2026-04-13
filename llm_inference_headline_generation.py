@@ -395,6 +395,7 @@ quant_config = BitsAndBytesConfig(
 
 model_4bit = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
+    device_map = "auto",
     quantization_config=quant_config
 )
 
@@ -434,6 +435,16 @@ print(output)
 
 num_gpus = torch.cuda.device_count()
 print(f"Number of GPUs available: {num_gpus}")
+
+print(model_4bit.hf_device_map)
+# e.g. {'model.embed_tokens': 0, 'model.layers.0': 0, ..., 'model.layers.25': 1, 'lm_head': 1}
+
+# 2. How many unique GPUs were used
+gpus_used = set(
+    v for v in model_4bit.hf_device_map.values()
+    if isinstance(v, int)  # filters out "cpu" or "disk" if offloading kicked in
+)
+print(f"GPUs used: {len(gpus_used)} — devices {sorted(gpus_used)}")
 
 if num_gpus > 1:
     print("Multi-GPU environment detected.")
