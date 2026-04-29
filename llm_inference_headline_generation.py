@@ -34,6 +34,14 @@ import time
 from pprint import pprint
 import torch.profiler
 import torch.nn.utils.prune as prune
+import subprocess
+
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+except Exception:
+    VLLM_AVAILABLE = False
+
 
 os.environ["HF_HUB_OFFLINE"] = "1" #Set the Hugging face in offline mode.
 # ---- Constants ----
@@ -512,6 +520,46 @@ else:
 # TODO: Evaluate with Pipeline Parallelism.
 # This is more advanced and may require manually defining a device_map to assign
 # different layers of the model to different GPUs.
+
+
+
+def benchmark_vllm_inference(model_name, prompts, max_new_tokens=20):
+    """Optional benchmark path for vLLM serving-style inference."""
+    if not VLLM_AVAILABLE:
+        print("vLLM is not installed. Install with: pip install vllm")
+        return None
+
+    sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0.0)
+    llm = LLM(model=model_name, tensor_parallel_size=max(1, torch.cuda.device_count()))
+
+    start = time.perf_counter()
+    outputs = llm.generate(prompts, sampling_params)
+    end = time.perf_counter()
+
+    generated_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+    latency = end - start
+    throughput = generated_tokens / latency if latency > 0 else 0.0
+
+    print(f"vLLM latency: {latency:.4f}s | throughput: {throughput:.2f} tok/s")
+    return {"latency": latency, "throughput": throughput, "outputs": outputs}
+
+
+def print_nsight_profile_command(script_path="llm_inference_headline_generation.py", nproc_per_node=1):
+    """Print a ready-to-run Nsight Systems profiling command for manager demos."""
+    cmd = (
+        f"nsys profile --trace=cuda,nvtx,osrt --sample=none --force-overwrite=true "
+        f"--output=nsys_llm_profile torchrun --nproc_per_node={nproc_per_node} {script_path}"
+    )
+    print("Run this command to collect Nsight Systems traces:")
+    print(cmd)
+    return cmd
+
+
+
+# Optional: manager-friendly benchmarking hooks
+print_nsight_profile_command(nproc_per_node=max(1, num_gpus))
+# Example vLLM run (uncomment when vLLM is installed):
+# benchmark_vllm_inference(MODEL_NAME, [PROMPT.format(article=dataset[0]["text"])], MAX_NEW_TOKENS)
 
 # %% [markdown]
 # # 7. Advanced Decoding: Speculative Decoding
