@@ -296,12 +296,17 @@ else:
 
 
 def prune_model_weights(model, amount=0.01):
+    if not 0 <= amount <= 1:
+        raise ValueError("amount must be between 0 and 1.")
+
+    pruned_layers = 0
     for module in model.modules():
         if isinstance(module, torch.nn.Linear):
-            print("Pruning first linear layer only")
+            pruned_layers += 1
             prune.l1_unstructured(module, name="weight", amount=amount)
             prune.remove(module, "weight")
-            break
+
+    print(f"Pruned {pruned_layers} linear layer(s)")
     return model
 
 # TODO: Evaluate the pruned model.
@@ -579,7 +584,6 @@ print("\n--- SUMMARY OF THIS STEP ---")
 print(f"Tokens generated this step: {len(final_accepted_ids)} -> '{target_tokenizer.decode(final_accepted_ids)}'")
 print(f"Target Model expensive calls: 1")
 print(f"New Context: '{target_tokenizer.decode(new_context_ids[0])}'")
-
 
 
 
