@@ -545,7 +545,7 @@ def benchmark_vllm_inference(model_name, prompts, max_new_tokens=20):
 
 
 def print_nsight_profile_command(script_path="llm_inference_headline_generation.py", nproc_per_node=1):
-    """Print a ready-to-run Nsight Systems profiling command for manager demos."""
+    """Print a ready-to-run Nsight Systems profiling command."""
     cmd = (
         f"nsys profile --trace=cuda,nvtx,osrt --sample=none --force-overwrite=true "
         f"--output=nsys_llm_profile torchrun --nproc_per_node={nproc_per_node} {script_path}"
@@ -556,7 +556,7 @@ def print_nsight_profile_command(script_path="llm_inference_headline_generation.
 
 
 
-# Optional: manager-friendly benchmarking hooks
+# Optional benchmarking hooks
 print_nsight_profile_command(nproc_per_node=max(1, num_gpus))
 # Example vLLM run (uncomment when vLLM is installed):
 # benchmark_vllm_inference(MODEL_NAME, [PROMPT.format(article=dataset[0]["text"])], MAX_NEW_TOKENS)
