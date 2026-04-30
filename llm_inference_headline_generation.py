@@ -470,51 +470,57 @@ else:
 # TODO: Implement and evaluate speculative decoding.
 DRAFT_MODEL_NAME = "/voc/shared/models/llama/Llama-3.2-1B"
 TARGET_MODEL_NAME = "/voc/shared/models/llama/Llama-3.2-3B"
-K_DRAFT_TOKENS = 5 # Let's have the draft model propose 5 tokens
+K_DRAFT_TOKENS = 5  # Let's have the draft model propose 5 tokens
+
+spec_device = "cuda" if torch.cuda.is_available() else "cpu"
+spec_dtype = torch.float16 if spec_device == "cuda" else torch.float32
+
+print(f"Loading Target Model ('The Scout'): {TARGET_MODEL_NAME} on {spec_device} ({spec_dtype})...")
 target_tokenizer = AutoTokenizer.from_pretrained(TARGET_MODEL_NAME, local_files_only=True)
-target_model = AutoModelForCausalLM.from_pretrained(TARGET_MODEL_NAME, local_files_only=True,
-                    #torch_dtype = torch.float16,
-                    #device_map = "auto",
-                    torch_dtype=torch.float32,
-                    low_cpu_mem_usage=True,
-                    attn_implementation="eager")
+target_model = AutoModelForCausalLM.from_pretrained(
+    TARGET_MODEL_NAME,
+    local_files_only=True,
+    torch_dtype=spec_dtype,
+    low_cpu_mem_usage=True,
+    attn_implementation="eager",
+)
 
 if target_tokenizer.pad_token_id is None and target_tokenizer.eos_token_id is not None:
-    target_tokenizer_.pad_token = target_tokenizer.eos_token
-
+    target_tokenizer.pad_token = target_tokenizer.eos_token
 if target_model.config.pad_token_id is None:
     target_model.config.pad_token_id = target_tokenizer.pad_token_id
 
-print(f"Loaded Target Model ('The Scout'): {TARGET_MODEL_NAME}...")
-INITIAL_CONTEXT_TEXT = dataset[0]["text"]
-
+target_model.to(spec_device)
 target_model.eval()
 
-print(f"Loading Draft Model ('The Scout'): {DRAFT_MODEL_NAME}...")
-draft_model = AutoModelForCausalLM.from_pretrained(DRAFT_MODEL_NAME, local_files_only=True,
-                    #torch_dtype = torch.float16,
-                    #device_map = "auto",
-                    torch_dtype=torch.float32,
-                    low_cpu_mem_usage=True,
-                    attn_implementation="eager")
+print(f"Loading Draft Model ('The Sprinter'): {DRAFT_MODEL_NAME} on {spec_device} ({spec_dtype})...")
+draft_tokenizer = AutoTokenizer.from_pretrained(DRAFT_MODEL_NAME, local_files_only=True)
+draft_model = AutoModelForCausalLM.from_pretrained(
+    DRAFT_MODEL_NAME,
+    local_files_only=True,
+    torch_dtype=spec_dtype,
+    low_cpu_mem_usage=True,
+    attn_implementation="eager",
+)
 
 if draft_tokenizer.pad_token_id is None and draft_tokenizer.eos_token_id is not None:
-    draft_tokenizer_.pad_token = draft_tokenizer.eos_token
-
+    draft_tokenizer.pad_token = draft_tokenizer.eos_token
 if draft_model.config.pad_token_id is None:
     draft_model.config.pad_token_id = draft_tokenizer.pad_token_id
 
-draft_model.eval() # Set to evaluation mode
+draft_model.to(spec_device)
+draft_model.eval()  # Set to evaluation mode
 
+INITIAL_CONTEXT_TEXT = dataset[0]["text"]
 print(f"--- Step 1: Draft Model generates {K_DRAFT_TOKENS} candidate tokens ---")
-current_context_ids = draft_tokenizer.encode(INITIAL_CONTEXT_TEXT, return_tensors="pt")
+current_context_ids = draft_tokenizer.encode(INITIAL_CONTEXT_TEXT, return_tensors="pt").to(spec_device)
 
 with torch.no_grad():
-    # Use the draft model's generate function for simplicity
     draft_output_ids = draft_model.generate(
         current_context_ids,
         max_new_tokens=K_DRAFT_TOKENS,
-        pad_token_id=tokenizer.eos_token_id
+        pad_token_id=draft_tokenizer.eos_token_id,
+        use_cache=True,
     )
 
 # Isolate just the newly generated draft tokens
