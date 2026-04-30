@@ -34,6 +34,14 @@ import time
 from pprint import pprint
 import torch.profiler
 import torch.nn.utils.prune as prune
+import subprocess
+
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+except Exception:
+    VLLM_AVAILABLE = False
+
 
 os.environ["HF_HUB_OFFLINE"] = "1" #Set the Hugging face in offline mode.
 # ---- Constants ----
@@ -103,16 +111,24 @@ def load_news_dataset(path):
 # ### Your Task: Implement the Evaluation Pipeline
 # You need to implement the core functions for loading a model, generating a headline, and evaluating performance. These functions will be reused for every optimization technique.
 
-def load_model(model_name, quantization_config=None):
+def load_model(model_name, quantization_config=None, device_map=None):
     """TODO: Implement the logic for loading a tokenizer and model."""
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
-        model     = AutoModelForCausalLM.from_pretrained(model_name, local_files_only=True,
-                    #torch_dtype = torch.float16,
-                    #device_map = "auto",
-                    torch_dtype=torch.float32,
-                    low_cpu_mem_usage=True,
-                    attn_implementation="eager")
+        model_kwargs = dict(
+            local_files_only=True,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+            attn_implementation="eager"
+        )
+
+        if quantization_config is not None:
+            model_kwargs["quantization_config"] = quantization_config
+
+        if device_map is not None:
+            model_kwargs["device_map"] = device_map
+
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
         if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -126,6 +142,54 @@ def load_model(model_name, quantization_config=None):
           f"and the model name is correct. Error: {e}")        
     return tokenizer, model
 
+
+
+
+
+
+def load_model_tensor_parallel(model_name, quantization_config=None):
+    """Load model with real tensor parallelism (`tp_plan="auto"`) for multi-process runs.
+
+    Run with:
+      torchrun --nproc_per_node=<num_gpus> llm_inference_headline_generation.py
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+
+    model_kwargs = dict(
+        local_files_only=True,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        attn_implementation="eager",
+        tp_plan="auto"
+    )
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if model.config.pad_token_id is None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+    print("Tensor parallel plan:", getattr(model, "_tp_plan", None))
+    print("Tensor parallel world size:", int(os.environ.get("WORLD_SIZE", "1")))
+    return tokenizer, model
+def describe_parallelism_support(model):
+    """Explain what `device_map="auto"` actually did for the loaded model."""
+    device_map = getattr(model, "hf_device_map", None)
+    if not device_map:
+        print("No hf_device_map found. Model is likely on a single device, so no model parallelism is active.")
+        return
+
+    gpus_used = sorted({v for v in device_map.values() if isinstance(v, int)})
+    if len(gpus_used) <= 1:
+        print("`device_map=\"auto\"` did not shard layers across multiple GPUs.")
+        print("Reason: only one visible GPU (or the model fits on one GPU).")
+        print("Note: this is layer/model sharding, not tensor-parallel kernel splitting.")
+    else:
+        print(f"Model layers were sharded across {len(gpus_used)} GPUs: {gpus_used}")
+        print("This is model/layer parallelism via Accelerate device mapping.")
 
 def generate_headline(model, tokenizer, summary, generation_args):
 
@@ -398,11 +462,7 @@ quant_config = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.float16
 )
 
-model_4bit = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    device_map = "auto",
-    quantization_config=quant_config
-)
+tokenizer_4bit, model_4bit = load_model(MODEL_NAME, quantization_config=quant_config, device_map="auto")
 
 memory_mb_4bit = get_model_memory_footprint(model_4bit)
 print(f"4-bit Memory Footprint: {memory_mb_4bit:.2f} MB")
@@ -436,23 +496,23 @@ print(output)
 
 # %%
 # TODO: Check for multi-GPU environment and evaluate with Tensor Parallelism.
-# The `device_map="auto"` in your `load_model` function should automatically apply this.
+# NOTE: `device_map="auto"` is model/layer sharding, not true tensor parallelism.
+# For true TP, launch this script with torchrun and call load_model_tensor_parallel(...).
 
 num_gpus = torch.cuda.device_count()
 print(f"Number of GPUs available: {num_gpus}")
 
-print(model_4bit.hf_device_map)
-# e.g. {'model.embed_tokens': 0, 'model.layers.0': 0, ..., 'model.layers.25': 1, 'lm_head': 1}
-
-# 2. How many unique GPUs were used
-gpus_used = set(
-    v for v in model_4bit.hf_device_map.values()
-    if isinstance(v, int)  # filters out "cpu" or "disk" if offloading kicked in
-)
-print(f"GPUs used: {len(gpus_used)} — devices {sorted(gpus_used)}")
+print(getattr(model_4bit, "hf_device_map", "No device map available"))
+describe_parallelism_support(model_4bit)
 
 if num_gpus > 1:
     print("Multi-GPU environment detected.")
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        print("WORLD_SIZE > 1, enabling true tensor parallel load...")
+        tp_tokenizer, tp_model = load_model_tensor_parallel(MODEL_NAME, quantization_config=quant_config)
+        print("Loaded TP model successfully.")
+    else:
+        print("To run true tensor parallelism, launch with torchrun (multi-process).")
 else:
     print("Single-GPU environment detected.Tensor and Pipeline parallelism will not be performed.")
 
@@ -460,6 +520,46 @@ else:
 # TODO: Evaluate with Pipeline Parallelism.
 # This is more advanced and may require manually defining a device_map to assign
 # different layers of the model to different GPUs.
+
+
+
+def benchmark_vllm_inference(model_name, prompts, max_new_tokens=20):
+    """Optional benchmark path for vLLM serving-style inference."""
+    if not VLLM_AVAILABLE:
+        print("vLLM is not installed. Install with: pip install vllm")
+        return None
+
+    sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0.0)
+    llm = LLM(model=model_name, tensor_parallel_size=max(1, torch.cuda.device_count()))
+
+    start = time.perf_counter()
+    outputs = llm.generate(prompts, sampling_params)
+    end = time.perf_counter()
+
+    generated_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+    latency = end - start
+    throughput = generated_tokens / latency if latency > 0 else 0.0
+
+    print(f"vLLM latency: {latency:.4f}s | throughput: {throughput:.2f} tok/s")
+    return {"latency": latency, "throughput": throughput, "outputs": outputs}
+
+
+def print_nsight_profile_command(script_path="llm_inference_headline_generation.py", nproc_per_node=1):
+    """Print a ready-to-run Nsight Systems profiling command."""
+    cmd = (
+        f"nsys profile --trace=cuda,nvtx,osrt --sample=none --force-overwrite=true "
+        f"--output=nsys_llm_profile torchrun --nproc_per_node={nproc_per_node} {script_path}"
+    )
+    print("Run this command to collect Nsight Systems traces:")
+    print(cmd)
+    return cmd
+
+
+
+# Optional benchmarking hooks
+print_nsight_profile_command(nproc_per_node=max(1, num_gpus))
+# Example vLLM run (uncomment when vLLM is installed):
+# benchmark_vllm_inference(MODEL_NAME, [PROMPT.format(article=dataset[0]["text"])], MAX_NEW_TOKENS)
 
 # %% [markdown]
 # # 7. Advanced Decoding: Speculative Decoding
