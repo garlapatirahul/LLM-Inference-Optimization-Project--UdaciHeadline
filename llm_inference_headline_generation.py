@@ -466,16 +466,77 @@ else:
 # 
 # **Your Task:** Speculative decoding uses a smaller, faster "draft" model to generate several candidate tokens. A larger, more accurate "target" model then verifies these tokens in a single forward pass. This can significantly speed up generation if the draft model is a good predictor. You will load a larger target model and a smaller draft model, benchmark the target model alone, and then benchmark it with assistance from the draft model.
 
-# %%
-# TODO: Implement and evaluate speculative decoding.
-DRAFT_MODEL_NAME = "/voc/shared/models/llama/Llama-3.2-1B"
-TARGET_MODEL_NAME = "/voc/shared/models/llama/Llama-3.2-3B"
-K_DRAFT_TOKENS = 5  # Let's have the draft model propose 5 tokens
+def run_speculative_decoding(draft_model, target_model, tokenizer, prompt_text, max_tokens, k):
+    """Runs a speculative decoding loop for a given k and measures performance."""
+    device = next(target_model.parameters()).device
+    input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
+    prompt_len = input_ids.shape[1]
+    target_passes = 0
 
+    start_time = time.time()
+    with torch.no_grad():
+        while input_ids.shape[1] < (prompt_len + max_tokens):
+            ctx_len = input_ids.shape[1]
+
+            # 1. Draft Phase: small model proposes k tokens
+            draft_ids = draft_model.generate(
+                input_ids, attention_mask=torch.ones_like(input_ids), max_new_tokens=k,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            draft_candidates = draft_ids[:, ctx_len:]
+            num_drafted = draft_candidates.shape[1]
+            if num_drafted == 0:
+                break
+
+            # 2. Verification Phase: target sees context + draft
+            verification_input = torch.cat([input_ids, draft_candidates], dim=1)
+            target_logits = target_model(verification_input).logits
+            target_passes += 1
+
+            # 3. Acceptance: compare draft vs target greedy preds
+            num_matched = 0
+            for i in range(num_drafted):
+                # logit at ctx_len + i - 1 predicts the i-th draft token
+                logit_idx = ctx_len + i - 1
+                target_pred_id = torch.argmax(target_logits[:, logit_idx, :], dim=-1)
+                if draft_candidates[0, i] == target_pred_id.item():
+                    num_matched += 1
+                else:
+                    break
+
+            # Accept all matched tokens
+            accepted = draft_candidates[:, :num_matched]
+            input_ids = torch.cat([input_ids, accepted], dim=1)
+
+            # On mismatch, accept the target's correction
+            if num_matched < num_drafted:
+                corr_idx = ctx_len + num_matched - 1
+                correction_id = torch.argmax(
+                    target_logits[:, corr_idx, :], dim=-1, keepdim=True
+                )
+                input_ids = torch.cat([input_ids, correction_id], dim=1)
+
+            if tokenizer.eos_token_id in input_ids[0, prompt_len:]:
+                break
+    end_time = time.time()
+
+    total_accepted = input_ids.shape[1] - prompt_len
+    avg_accepted_per_pass = total_accepted / target_passes if target_passes > 0 else 0
+    return end_time - start_time, target_passes, avg_accepted_per_pass
+
+#DRAFT_MODEL_NAME = "/voc/shared/models/llama/Llama-3.2-1B"
+#TARGET_MODEL_NAME = "/voc/shared/models/llama/Llama-3.2-3B"
+
+# --- Config ---
+TARGET_MODEL_NAME = "gpt2-medium"
+DRAFT_MODEL_NAME = "gpt2"
+MAX_TOTAL_TOKENS = 50
+K_VALUES_TO_TEST = [1, 2, 3, 4, 5, 8, 10]
 spec_device = "cuda" if torch.cuda.is_available() else "cpu"
 spec_dtype = torch.float16 if spec_device == "cuda" else torch.float32
 
-print(f"Loading Target Model ('The Scout'): {TARGET_MODEL_NAME} on {spec_device} ({spec_dtype})...")
+# --- Load Target ---
+print(f"Loading Target Model: {TARGET_MODEL_NAME} on {spec_device} ({spec_dtype})...")
 target_tokenizer = AutoTokenizer.from_pretrained(TARGET_MODEL_NAME, local_files_only=True)
 target_model = AutoModelForCausalLM.from_pretrained(
     TARGET_MODEL_NAME,
@@ -484,16 +545,15 @@ target_model = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
     attn_implementation="eager",
 )
-
 if target_tokenizer.pad_token_id is None and target_tokenizer.eos_token_id is not None:
     target_tokenizer.pad_token = target_tokenizer.eos_token
 if target_model.config.pad_token_id is None:
     target_model.config.pad_token_id = target_tokenizer.pad_token_id
-
-target_model.to(spec_device)
+target_model.to(spec_device)          # FIX: actually move to GPU
 target_model.eval()
 
-print(f"Loading Draft Model ('The Sprinter'): {DRAFT_MODEL_NAME} on {spec_device} ({spec_dtype})...")
+# --- Load Draft ---
+print(f"Loading Draft Model: {DRAFT_MODEL_NAME} on {spec_device} ({spec_dtype})...")
 draft_tokenizer = AutoTokenizer.from_pretrained(DRAFT_MODEL_NAME, local_files_only=True)
 draft_model = AutoModelForCausalLM.from_pretrained(
     DRAFT_MODEL_NAME,
@@ -502,94 +562,35 @@ draft_model = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
     attn_implementation="eager",
 )
-
 if draft_tokenizer.pad_token_id is None and draft_tokenizer.eos_token_id is not None:
     draft_tokenizer.pad_token = draft_tokenizer.eos_token
 if draft_model.config.pad_token_id is None:
     draft_model.config.pad_token_id = draft_tokenizer.pad_token_id
-
 draft_model.to(spec_device)
-draft_model.eval()  # Set to evaluation mode
+draft_model.eval()
 
-INITIAL_CONTEXT_TEXT = dataset[0]["text"]
-print(f"--- Step 1: Draft Model generates {K_DRAFT_TOKENS} candidate tokens ---")
-current_context_ids = draft_tokenizer.encode(INITIAL_CONTEXT_TEXT, return_tensors="pt").to(spec_device)
+# --- Prompt (truncated to avoid long-doc OOM) ---
+PROMPT_TEXT = dataset[0]["text"][:500]
 
-with torch.no_grad():
-    draft_output_ids = draft_model.generate(
-        current_context_ids,
-        max_new_tokens=K_DRAFT_TOKENS,
-        pad_token_id=draft_tokenizer.eos_token_id,
-        use_cache=True,
+# --- Run experiment ---
+results_log = []
+print("--- Running Speculative Decoding Experiment ---")
+for k in K_VALUES_TO_TEST:
+    print(f"Testing with K = {k}...")
+    spec_time, spec_passes, avg_accepted = run_speculative_decoding(
+        draft_model, target_model, target_tokenizer,   # FIX: correct tokenizer
+        PROMPT_TEXT, MAX_TOTAL_TOKENS, k
     )
+    results_log.append({
+        "K": k,
+        "Time (s)": spec_time,
+        "Target Passes": spec_passes,
+        "Avg. Accepted Tokens": avg_accepted,
+    })
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-# Isolate just the newly generated draft tokens
-draft_candidate_ids = draft_output_ids[:, current_context_ids.shape[1]:]
-
-print(f"Initial Context: '{INITIAL_CONTEXT_TEXT}'")
-print(f"Draft Model's Proposal: '{draft_tokenizer.decode(draft_candidate_ids[0], skip_special_tokens=True)}'")
-
-
-print(f"--- Step 2: Target Model verifies the draft in a single pass ---")
-# Combine context and draft for the verification input
-verification_input_ids = torch.cat([current_context_ids, draft_candidate_ids], dim=1)
-
-with torch.no_grad():
-    target_verification_logits = target_model(verification_input_ids).logits
-
-# Get the target model's top-1 prediction for each position
-# Note: The logits at index `t-1` predict the token at index `t`
-# So we look at logits from the start of the draft sequence onwards
-start_of_draft_in_logits = current_context_ids.shape[1] - 1
-end_of_draft_in_logits = verification_input_ids.shape[1] - 1
-
-target_preferred_ids = torch.argmax(target_verification_logits[:, start_of_draft_in_logits:end_of_draft_in_logits, :], dim=-1)
-
-print(f"Verification Input: '{target_tokenizer.decode(verification_input_ids[0])}'")
-print(f"Target Model's Preferences: '{target_tokenizer.decode(target_preferred_ids[0], skip_special_tokens=True)}'")
-
-print("--- Step 3: Comparing draft against target preferences ---")
-num_matched_tokens = 0
-for i in range(draft_candidate_ids.shape[1]):
-    draft_token = draft_candidate_ids[0, i]
-    target_token = target_preferred_ids[0, i]
-    
-    print(f"Pos {i+1}: Draft ('{draft_tokenizer.decode(draft_token)}') vs Target ('{target_tokenizer.decode(target_token)}')")
-    
-    if draft_token == target_token:
-        print("  ✅ Match!")
-        num_matched_tokens += 1
-    else:
-        print("  ❌ Mismatch! Halting comparison.")
-        break
-
-print(f"\nNumber of matched tokens: {num_matched_tokens}")
-
-
-print("--- Step 4: Constructing the final accepted sequence for this step ---")
-
-# 1. Take all the tokens that matched
-accepted_ids = draft_candidate_ids[0, :num_matched_tokens]
-
-# 2. Take the target's token at the next position 
-# (This is either the correction at the mismatch point, or the next token if all matched)
-if num_matched_tokens < target_preferred_ids.shape[1]:
-    next_token = target_preferred_ids[0, num_matched_tokens].unsqueeze(0)
-    final_accepted_ids = torch.cat([accepted_ids, next_token], dim=0)
-else: # This case is rare, means we ran out of target preferences
-    final_accepted_ids = accepted_ids
-
-print(f"Matched Tokens Accepted: '{target_tokenizer.decode(accepted_ids)}'")
-if num_matched_tokens < target_preferred_ids.shape[1]:
-    print(f"Correction/Extension Token: '{target_tokenizer.decode(next_token)}'")
-
-# Update our full context
-new_context_ids = torch.cat([current_context_ids, final_accepted_ids.unsqueeze(0)], dim=1)
-
-print("\n--- SUMMARY OF THIS STEP ---")
-print(f"Tokens generated this step: {len(final_accepted_ids)} -> '{target_tokenizer.decode(final_accepted_ids)}'")
-print(f"Target Model expensive calls: 1")
-print(f"New Context: '{target_tokenizer.decode(new_context_ids[0])}'")
-
-
-
+df_results = pd.DataFrame(results_log)
+print("--- Speculative Decoding Experiment Results Summary ---")
+print(df_results.to_string())
