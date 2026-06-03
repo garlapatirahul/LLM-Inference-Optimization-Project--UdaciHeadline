@@ -155,3 +155,52 @@ The demand for COVID-19
 
 
 Self CPU time total: 25.926s
+
+
+
+#step7 Advanced Decoding: Speculative Decoding
+
+Reading the results:
+ At K=1 you get 50 target passes (one per token, no speedup — basic
+decoding). As K grows, target passes drop and avg accepted tokens climb,
+which is exactly the win: fewer expensive target forward passes because
+the cheap draft model is correctly predicting multiple tokens at a time.
+
+
+
+Loading Target Model: gpt2-medium on cuda (torch.float16)...
+Loading weights: 100%
+ 292/292 [00:03<00:00, 126.02it/s]
+Loading Draft Model: gpt2 on cuda (torch.float16)...
+Loading weights: 100%
+ 148/148 [00:01<00:00, 198.35it/s]
+[transformers] The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+--- Running Speculative Decoding Experiment ---
+Testing with K = 1...
+Testing with K = 2...
+Testing with K = 3...
+Testing with K = 4...
+Testing with K = 5...
+Testing with K = 8...
+Testing with K = 10...
+--- Speculative Decoding Experiment Results Summary ---
+    K  Time (s)  Target Passes  Avg. Accepted Tokens
+0   1  2.788328             50              1.000000
+1   2  1.565935             27              1.851852
+2   3  1.260171             19              2.631579
+3   4  1.356594             17              3.058824
+4   5  1.462748             16              3.250000
+5   8  1.549432             12              4.333333
+6  10  1.844262             12              4.333333
+
+Sweet spot: K=3 at 1.26s — the fastest of the batch. After that, time
+creeps back up even though passes keep falling. Classic spec-decoding
+tradeoff: past a certain K, the draft model's predictions diverge from
+the target, so you spend draft compute generating tokens that get
+rejected. The wasted draft work outweighs the saved target passes.
+
+K=8 and K=10 produce identical results (12 passes, 4.33 accepted). That
+means generation hits the MAX_TOTAL_TOKENS=50 cap or EOS before the larger
+K budget is fully used — the extra draft headroom is unused, so K=10 just
+costs slightly more draft time (1.55s → 1.84s) for no benefit.
+
