@@ -174,7 +174,9 @@ Loading weights: 100%
 Loading Draft Model: gpt2 on cuda (torch.float16)...
 Loading weights: 100%
  148/148 [00:01<00:00, 198.35it/s]
-[transformers] The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[transformers] 
+
+
 --- Running Speculative Decoding Experiment ---
 Testing with K = 1...
 Testing with K = 2...
