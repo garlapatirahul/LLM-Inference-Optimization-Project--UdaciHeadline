@@ -186,14 +186,16 @@ Testing with K = 10
 
 
 --- Speculative Decoding Experiment Results Summary ---
-    K  Time (s)  Target Passes  Avg. Accepted Tokens
-0   1  2.788328             50              1.000000
-1   2  1.565935             27              1.851852
-2   3  1.260171             19              2.631579
-3   4  1.356594             17              3.058824
-4   5  1.462748             16              3.250000
-5   8  1.549432             12              4.333333
-6  10  1.844262             12              4.333333
+
+| K | Time (s) | Target Passes | Avg. Accepted Tokens | Speedup vs K=1 | Target Pass Reduction vs K=1 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 2.788328 | 50 | 1.000000 | 1.00x | 0.00% |
+| 2 | 1.565935 | 27 | 1.851852 | 1.78x | 46.00% |
+| 3 | 1.260171 | 19 | 2.631579 | 2.21x | 62.00% |
+| 4 | 1.356594 | 17 | 3.058824 | 2.06x | 66.00% |
+| 5 | 1.462748 | 16 | 3.250000 | 1.91x | 68.00% |
+| 8 | 1.549432 | 12 | 4.333333 | 1.80x | 76.00% |
+| 10 | 1.844262 | 12 | 4.333333 | 1.51x | 76.00% |
 
 Sweet spot: K=3 at 1.26s — the fastest of the batch. After that, time
 creeps back up even though passes keep falling. Classic spec-decoding
