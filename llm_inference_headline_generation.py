@@ -39,6 +39,7 @@ os.environ["HF_HUB_OFFLINE"] = "1" #Set the Hugging face in offline mode.
 # ---- Constants ----
 MODEL_NAME = "/voc/shared/models/llama/Llama-3.2-1B"
 MAX_NEW_TOKENS = 20 # Max length for the generated headline
+EVAL_SAMPLE_COUNT = 20 # Number of samples for each comparable benchmark
 print(os.listdir("/voc/shared/models/llama"))
 PROMPT = \
 """
@@ -104,15 +105,24 @@ def load_news_dataset(path):
 # You need to implement the core functions for loading a model, generating a headline, and evaluating performance. These functions will be reused for every optimization technique.
 
 def load_model(model_name, quantization_config=None):
-    """TODO: Implement the logic for loading a tokenizer and model."""
+    """Load a tokenizer/model pair and place the model on the best available device."""
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
-        model     = AutoModelForCausalLM.from_pretrained(model_name, local_files_only=True,
-                    #torch_dtype = torch.float16,
-                    #device_map = "auto",
-                    torch_dtype=torch.float32,
-                    low_cpu_mem_usage=True,
-                    attn_implementation="eager")
+        model_kwargs = {
+            "local_files_only": True,
+            "low_cpu_mem_usage": True,
+            "attn_implementation": "eager",
+        }
+        if quantization_config is not None:
+            model_kwargs["quantization_config"] = quantization_config
+            model_kwargs["device_map"] = "auto"
+        else:
+            model_kwargs["torch_dtype"] = torch.float16 if torch.cuda.is_available() else torch.float32
+
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        if quantization_config is None:
+            model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
         if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -123,71 +133,148 @@ def load_model(model_name, quantization_config=None):
         print("pad_token_id:", tokenizer.pad_token_id)
     except Exception as e:
         print(f"Error loading model {model_name}. Make sure you have internet connection "
-          f"and the model name is correct. Error: {e}")        
+          f"and the model name is correct. Error: {e}")
+        raise
     return tokenizer, model
 
 
-def generate_headline(model, tokenizer, summary, generation_args):
+def get_model_device(model):
+    """Return the primary device for regular and accelerate-dispatched models."""
+    if hasattr(model, "device"):
+        return model.device
+    return next(model.parameters()).device
 
-    print("Entered generate_headline")
+
+def synchronize_if_cuda(device):
+    """Synchronize CUDA work before reading timers or memory counters."""
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def reset_gpu_peak_memory(device):
+    """Reset CUDA peak memory stats when evaluating on a GPU."""
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def get_peak_gpu_memory_mb(device):
+    """Return peak allocated CUDA memory in MiB for the current evaluation window."""
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        return torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+    return 0.0
+
+
+def generate_headline(model, tokenizer, summary, generation_args):
     prompt = PROMPT.format(article=summary)
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256)
-    print("Tokenization done")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-    print("Moved inputs to device")
-    print({k: v.shape for k, v in inputs.items()})
+    device = get_model_device(model)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
-        if model.device.type == "cuda":
-            torch.cuda.synchronize()
-        print("About to call model.generate")
+        synchronize_if_cuda(device)
         outputs = model.generate(
             **inputs,
             **generation_args,
             pad_token_id=tokenizer.pad_token_id,
         )
-        if model.device.type == "cuda":
-            torch.cuda.synchronize()
-        print("model.generate finished")
+        synchronize_if_cuda(device)
 
     input_length = inputs["input_ids"].shape[1]
     generated_tokens = outputs[0][input_length:]
     generated_headline = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
     return generated_headline, generated_tokens
 
+
 def report_metrics(results, latencies, max_new_tokens):
-    """TODO: Implement the logic for calculating and reporting all performance metrics."""
-    
-    pass
+    """Calculate latency, throughput, GPU memory, and ROUGE metrics consistently."""
+    if not results:
+        raise ValueError("No successful generations were collected; cannot report metrics.")
+
+    latency_array = np.asarray(latencies, dtype=np.float64)
+    total_generated_tokens = sum(int(row["actual_new_tokens"]) for row in results)
+    total_latency = float(latency_array.sum())
+    gpu_memory_values = [float(row.get("gpu_memory_mb", 0.0)) for row in results]
+
+    rouge = load_metric("rouge")
+    rouge_scores = rouge.compute(
+        predictions=[row["prediction"] for row in results],
+        references=[row["reference"] for row in results],
+        use_stemmer=True,
+    )
+
+    metrics = {
+        "samples": len(results),
+        "max_new_tokens": max_new_tokens,
+        "avg_latency_s": float(latency_array.mean()),
+        "p99_latency_s": float(np.percentile(latency_array, 99)),
+        "throughput_tokens_per_s": total_generated_tokens / total_latency if total_latency else 0.0,
+        "peak_gpu_memory_mb": max(gpu_memory_values) if gpu_memory_values else 0.0,
+        "total_generated_tokens": total_generated_tokens,
+        "rouge1": float(rouge_scores["rouge1"]),
+        "rouge2": float(rouge_scores["rouge2"]),
+        "rougeL": float(rouge_scores["rougeL"]),
+        "rougeLsum": float(rouge_scores["rougeLsum"]),
+    }
+
+    print("Evaluation metrics:")
+    for key, value in metrics.items():
+        if isinstance(value, float):
+            print(f"  - {key}: {value:.4f}")
+        else:
+            print(f"  - {key}: {value}")
+    return metrics
+
 
 def evaluate_model(dataset, model, tokenizer, generation_args, n=20):
-    """TODO: Implement the model evaluation loop."""
-    num_samples = len(dataset)
+    """Run a bounded evaluation loop and return per-sample results plus aggregate metrics."""
+    sample_count = min(n, len(dataset))
     model.eval()
-    for i in range(num_samples):
+    results = []
+    latencies = []
+    device = get_model_device(model)
+
+    reset_gpu_peak_memory(device)
+    for i in range(sample_count):
         sample = dataset[i]
         summary = sample["text"]
         reference = sample["headline"]
 
         try:
-            generated_headline, actual_new_tokens = generate_headline(
+            synchronize_if_cuda(device)
+            start_time = time.perf_counter()
+            generated_headline, generated_tokens = generate_headline(
                 model=model,
                 tokenizer=tokenizer,
                 summary=summary,
                 generation_args=generation_args
             )
+            synchronize_if_cuda(device)
+            latency = time.perf_counter() - start_time
 
             results.append({
                 "input": summary,
                 "reference": reference,
                 "prediction": generated_headline,
-                "actual_new_tokens": actual_new_tokens
+                "actual_new_tokens": int(generated_tokens.numel()),
+                "latency_s": latency,
+                "gpu_memory_mb": get_peak_gpu_memory_mb(device),
             })
             latencies.append(latency)
 
         except Exception as e:
-            print(f"Error during generation for sample {i}: {e}")        
-    
+            print(f"Error during generation for sample {i}: {e}")
+
+    metrics = report_metrics(results, latencies, generation_args.get("max_new_tokens", MAX_NEW_TOKENS))
+    return results, metrics
+
+
+def benchmark_configuration(name, dataset, model, tokenizer, generation_args, n=20):
+    """Evaluate one optimization configuration and label its metrics."""
+    print(f"\n--- Evaluating {name} ---")
+    results, metrics = evaluate_model(dataset, model, tokenizer, generation_args, n=n)
+    metrics["configuration"] = name
+    return results, metrics
+
 
 # %%
 # TODO: Establish your baseline performance.
@@ -205,7 +292,22 @@ tokenizer, model = load_model(MODEL_NAME, quantization_config=None)
 #model.to(gpu_device)
 dataset = load_news_dataset("rmisra/news-category-dataset")
 memory_mb_32bit = get_model_memory_footprint(model)
-print(f"4-bit Memory Footprint: {memory_mb_32bit:.2f} MB")
+print(f"Baseline Model Memory Footprint: {memory_mb_32bit:.2f} MB")
+
+benchmark_summary = []
+baseline_generation_args = {
+    "max_new_tokens": MAX_NEW_TOKENS,
+    "use_cache": False
+}
+_, baseline_metrics = benchmark_configuration(
+    "baseline_no_kv_cache",
+    dataset,
+    model,
+    tokenizer,
+    baseline_generation_args,
+    n=EVAL_SAMPLE_COUNT,
+)
+benchmark_summary.append(baseline_metrics)
 
 if torch.cuda.is_available():
     print("\n--- Profiling on GPU ---")
@@ -215,10 +317,7 @@ if torch.cuda.is_available():
     
     print(dataset[0])
     # TODO: Call run_gpu_inference for warm-up
-    generation_args = {
-        "max_new_tokens": MAX_NEW_TOKENS,
-        "use_cache": False
-    }
+    generation_args = baseline_generation_args
     model.eval()
     if torch.cuda.is_available():
         print("allocated GB:", torch.cuda.memory_allocated() / 1e9)
@@ -257,6 +356,15 @@ generation_args = {
     "max_new_tokens": MAX_NEW_TOKENS,
     "use_cache": True
 }
+_, kv_cache_metrics = benchmark_configuration(
+    "kv_cache",
+    dataset,
+    model,
+    tokenizer,
+    generation_args,
+    n=EVAL_SAMPLE_COUNT,
+)
+benchmark_summary.append(kv_cache_metrics)
 
 if torch.cuda.is_available():
     print("\n--- Profiling on GPU ---")
@@ -313,24 +421,25 @@ def prune_model_weights(model, amount=0.01):
 
 def run_performance_test(model, tokenizer, prompt, max_tokens, num_runs):
     """Measure average generation speed and get a sample output."""
-    total_time = 0
+    total_time = 0.0
+    total_tokens = 0
     sample_output = "Error during generation."
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    total_tokens=0
+    local_generation_args = {"max_new_tokens": max_tokens, "use_cache": True}
+    device = get_model_device(model)
+
     with torch.no_grad():
         for i in range(num_runs):
-            if device.type == 'cuda': torch.cuda.synchronize()
+            synchronize_if_cuda(device)
             start_time = time.perf_counter()
-            
-            #outputs = model.generate(**inputs, max_new_tokens=max_tokens, pad_token_id=tokenizer.eos_token_id)
-            generated_headline, generated_tokens = generate_headline(model, tokenizer, dataset[0]["text"], generation_args)
-            if device.type == 'cuda': torch.cuda.synchronize()
-            end_time = time.perf_counter()
-            total_time += (end_time - start_time)
-            total_tokens += generated_tokens.shape[0]
-            if i == 0: # Get sample from the first run
-                #sample_output = tokenizer.decode(generated_headline, skip_special_tokens=True)
+            generated_headline, generated_tokens = generate_headline(
+                model, tokenizer, prompt, local_generation_args
+            )
+            synchronize_if_cuda(device)
+            total_time += time.perf_counter() - start_time
+            total_tokens += int(generated_tokens.numel())
+            if i == 0:
                 sample_output = generated_headline
+
     avg_time = total_time / num_runs
     return avg_time, sample_output, total_tokens
 
@@ -338,21 +447,27 @@ def run_performance_test(model, tokenizer, prompt, max_tokens, num_runs):
 print("CUDA available:", torch.cuda.is_available())
 print("CUDA device count:", torch.cuda.device_count())
 
-print(torch.cuda.get_device_name(0))
-free_mem, total_mem = torch.cuda.mem_get_info()
-print(f"Free GPU memory: {free_mem/1e9:.2f} GB / {total_mem/1e9:.2f} GB")
+if torch.cuda.is_available():
+    print(torch.cuda.get_device_name(0))
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    print(f"Free GPU memory: {free_mem/1e9:.2f} GB / {total_mem/1e9:.2f} GB")
+else:
+    free_mem, total_mem = 0, 0
 
 #tokenizer, model = load_model(MODEL_NAME, quantization_config=None)
-torch.cuda.empty_cache()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 gc.collect()
 pruned_model = prune_model_weights(model, amount=0.3)
 
 #pruned_model = pruned_model.to(device)
 
-print(f"After load - Free GPU memory: {free_mem/1e9:.2f} GB / {total_mem/1e9:.2f} GB")
+if torch.cuda.is_available():
+    print(f"After load - Free GPU memory: {free_mem/1e9:.2f} GB / {total_mem/1e9:.2f} GB")
 # Move model to CPU before pruning
 #model = model.cpu()
-torch.cuda.empty_cache()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 gc.collect()
 
 #pruned_model = prune_model_weights(model, amount=0.05)
@@ -365,19 +480,19 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_SPEED_RUNS = 3
 
 #tokenizer, model = load_model(MODEL_NAME, quantization_config=None)
-free_mem, total_mem = torch.cuda.mem_get_info()
-print(f"After load - Free GPU memory: {free_mem/1e9:.2f} GB / {total_mem/1e9:.2f} GB")
+if torch.cuda.is_available():
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    print(f"After load - Free GPU memory: {free_mem/1e9:.2f} GB / {total_mem/1e9:.2f} GB")
 
-avg_time, output, total_tokens = run_performance_test(pruned_model, tokenizer, dataset[0]["text"], MAX_NEW_TOKENS, NUM_SPEED_RUNS)
-
-#Log results
-#results_log.append({
-#        "Configuration": config_name,
-#        "Avg Inference Time (s)": f"{avg_time:.4f}",
-#        "Generated Output": output
-#    })
-    
-print(f"Result:\n  - Avg Time: {avg_time:.4f}s\n  - Output: '{output}'s\n  - Total Tokens: {total_tokens:.4f}")
+_, pruned_metrics = benchmark_configuration(
+    "pruned_30_percent",
+    dataset,
+    pruned_model,
+    tokenizer,
+    generation_args,
+    n=EVAL_SAMPLE_COUNT,
+)
+benchmark_summary.append(pruned_metrics)
 
 # Clean up to save memory
 #del pruned_model
@@ -398,25 +513,35 @@ quant_config = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.float16
 )
 
-model_4bit = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    device_map = "auto",
-    quantization_config=quant_config
-)
+tokenizer_4bit, model_4bit = load_model(MODEL_NAME, quantization_config=quant_config)
 
 memory_mb_4bit = get_model_memory_footprint(model_4bit)
 print(f"4-bit Memory Footprint: {memory_mb_4bit:.2f} MB")
 
 model_4bit.eval()
-latencies_4bit = []
+_, quantized_metrics = benchmark_configuration(
+    "quantized_4bit",
+    dataset,
+    model_4bit,
+    tokenizer_4bit,
+    generation_args,
+    n=EVAL_SAMPLE_COUNT,
+)
+benchmark_summary.append(quantized_metrics)
 
-avg_time, output, total_tokens = run_performance_test(model_4bit, tokenizer, dataset[0]["text"], MAX_NEW_TOKENS, NUM_SPEED_RUNS)
-
-throughput_4bit = total_tokens/(avg_time)
-
-print(f"4-bit Avg. Latency: {avg_time:.4f} s 4-bit Throughput: {throughput_4bit:.4f} s (over {NUM_SPEED_RUNS} runs)")
-
-print(output)
+print("--- Comparable Benchmark Summary ---")
+summary_columns = [
+    "configuration",
+    "avg_latency_s",
+    "p99_latency_s",
+    "throughput_tokens_per_s",
+    "peak_gpu_memory_mb",
+    "rouge1",
+    "rouge2",
+    "rougeL",
+    "rougeLsum",
+]
+print(pd.DataFrame(benchmark_summary)[summary_columns].to_string(index=False))
 
 
 
