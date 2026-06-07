@@ -26,14 +26,29 @@ import pandas as pd
 import numpy as np
 import kagglehub
 import gc
+import evaluate
+from rouge_score import rouge_scorer
 print("kagglehub imported successfully")
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, GPTQConfig
 from evaluate import load as load_metric
 import time
 from pprint import pprint
 import torch.profiler
 import torch.nn.utils.prune as prune
+#import deepspeed
+import subprocess
+import pyarrow as pa
+print(pa.__version__)
+import numpy as np
+print(np.__version__)
+
+
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+except Exception:
+    VLLM_AVAILABLE = False
 
 os.environ["HF_HUB_OFFLINE"] = "1" #Set the Hugging face in offline mode.
 # ---- Constants ----
@@ -61,8 +76,6 @@ if torch.cuda.is_available():
 # ## Data Loading
 # 
 # We will use the "News Category Dataset" from Kaggle. The `kagglehub` library makes it easy to download and access. Your task is to implement the function to load and preprocess the data according to the docstring.
-
-
 
 def load_news_dataset(path):
     """
@@ -103,18 +116,33 @@ def load_news_dataset(path):
 # ### Your Task: Implement the Evaluation Pipeline
 # You need to implement the core functions for loading a model, generating a headline, and evaluating performance. These functions will be reused for every optimization technique.
 
-def load_model(model_name, quantization_config=None):
+def load_model(model_name, quantization_config=None, device_map=None):
     """TODO: Implement the logic for loading a tokenizer and model."""
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
-        model     = AutoModelForCausalLM.from_pretrained(model_name, local_files_only=True,
-                    #torch_dtype = torch.float16,
-                    #device_map = "auto",
-                    torch_dtype=torch.float32,
-                    low_cpu_mem_usage=True,
-                    attn_implementation="eager")
+        model_kwargs = dict(
+            local_files_only=True,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+            attn_implementation="eager"
+        )
+
+        if quantization_config is not None:
+            model_kwargs["quantization_config"] = quantization_config
+
+        if device_map is not None:
+            model_kwargs["device_map"] = device_map
+
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
         if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
             tokenizer.pad_token = tokenizer.eos_token
+
+        #The model's config and the tokenizer can get out of sync — the tokenizer might now know the pad token ID (from block 1), but the model's internal config still doesn't. This syncs them so the model knows which token to ignore during attention masking.
+
+
+        #Batched inference/training requires padding shorter sequences to match the longest one in the batch. Without a pad token, this breaks.
+        #The model uses pad_token_id to build the attention mask — telling the model to ignore padded positions. If it's None, you can get incorrect attention or loss calculations.
+        #This is essentially a safety/compatibility shim for decoder-only models that were originally designed for single-sequence generation, not batched training.
 
         if model.config.pad_token_id is None:
             model.config.pad_token_id = tokenizer.pad_token_id
@@ -125,6 +153,52 @@ def load_model(model_name, quantization_config=None):
         print(f"Error loading model {model_name}. Make sure you have internet connection "
           f"and the model name is correct. Error: {e}")        
     return tokenizer, model
+
+
+def load_model_tensor_parallel(model_name, quantization_config=None):
+    """Load model with real tensor parallelism (`tp_plan="auto"`) for multi-process runs.
+
+    Run with:
+      torchrun --nproc_per_node=<num_gpus> llm_inference_headline_generation.py
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+
+    model_kwargs = dict(
+        local_files_only=True,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        attn_implementation="eager",
+        tp_plan="auto"
+    )
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if model.config.pad_token_id is None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+    print("Tensor parallel plan:", getattr(model, "_tp_plan", None))
+    print("Tensor parallel world size:", int(os.environ.get("WORLD_SIZE", "1")))
+    return tokenizer, model
+    
+def describe_parallelism_support(model):
+    """Explain what `device_map="auto"` actually did for the loaded model."""
+    device_map = getattr(model, "hf_device_map", None)
+    if not device_map:
+        print("No hf_device_map found. Model is likely on a single device, so no model parallelism is active.")
+        return
+
+    gpus_used = sorted({v for v in device_map.values() if isinstance(v, int)})
+    if len(gpus_used) <= 1:
+        print("`device_map=\"auto\"` did not shard layers across multiple GPUs.")
+        print("Reason: only one visible GPU (or the model fits on one GPU).")
+        print("Note: this is layer/model sharding, not tensor-parallel kernel splitting.")
+    else:
+        print(f"Model layers were sharded across {len(gpus_used)} GPUs: {gpus_used}")
+        print("This is model/layer parallelism via Accelerate device mapping.")
 
 
 def generate_headline(model, tokenizer, summary, generation_args):
@@ -157,8 +231,18 @@ def generate_headline(model, tokenizer, summary, generation_args):
 
 def report_metrics(results, latencies, max_new_tokens):
     """TODO: Implement the logic for calculating and reporting all performance metrics."""
-    
-    pass
+    """Measure average generation speed and get a sample output."""
+    avg_latency = sum(latencies) / len(latencies) if latencies else 0
+    throughput = max_new_tokens / avg_latency if avg_latency > 0 else 0
+
+    print("Average latency:", avg_latency)
+    print("Throughput (tokens/sec):", throughput)
+
+    if "rouge" in results:
+        print("ROUGE scores:", results["rouge"])
+
+    if "sample_output" in results:
+        print("Sample output:", results["sample_output"])
 
 def evaluate_model(dataset, model, tokenizer, generation_args, n=20):
     """TODO: Implement the model evaluation loop."""
@@ -186,10 +270,52 @@ def evaluate_model(dataset, model, tokenizer, generation_args, n=20):
             latencies.append(latency)
 
         except Exception as e:
-            print(f"Error during generation for sample {i}: {e}")        
-    
+            print(f"Error during generation for sample {i}: {e}") 
 
-# %%
+def benchmark_model(model, tokenizer, dataset, generation_args,
+                    n_samples=25, label=""):
+    """
+    Scores ONE loaded model over the same n_samples articles.
+    Returns mean latency, throughput, and averaged ROUGE.
+    Run this once per technique (baseline, KV, pruned, quantized).
+    """
+    device = next(model.parameters()).device
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+
+    latencies, tok_counts, r1, r2, rl = [], [], [], [], []
+    n = min(n_samples, len(dataset))
+
+    for i in range(n):
+        article   = dataset[i]["text"]
+        reference = dataset[i]["headline"]
+
+        if device.type == "cuda": torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        gen_text, gen_tokens = generate_headline(model, tokenizer, article, generation_args)
+        if device.type == "cuda": torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        latencies.append(t1 - t0)
+        tok_counts.append(gen_tokens.shape[0])
+
+        s = scorer.score(reference, gen_text)   # reference first
+        r1.append(s["rouge1"].fmeasure)
+        r2.append(s["rouge2"].fmeasure)
+        rl.append(s["rougeL"].fmeasure)
+
+    mean_latency    = np.mean(latencies)
+    mean_throughput = np.sum(tok_counts) / np.sum(latencies)   # total tokens / total time
+
+    return {
+        "Technique": label,
+        "Mean Latency (s)": round(mean_latency, 4),
+        "Throughput (tok/s)": round(mean_throughput, 4),
+        "ROUGE-1": round(np.mean(r1), 4),
+        "ROUGE-2": round(np.mean(r2), 4),
+        "ROUGE-L": round(np.mean(rl), 4),
+        "N": n,
+    }
+
 # TODO: Establish your baseline performance.
 def get_model_memory_footprint(model):
     """Calculates and returns the model's memory footprint in MB."""
@@ -205,6 +331,7 @@ tokenizer, model = load_model(MODEL_NAME, quantization_config=None)
 #model.to(gpu_device)
 dataset = load_news_dataset("rmisra/news-category-dataset")
 memory_mb_32bit = get_model_memory_footprint(model)
+rows = []
 print(f"4-bit Memory Footprint: {memory_mb_32bit:.2f} MB")
 
 if torch.cuda.is_available():
@@ -239,19 +366,36 @@ if torch.cuda.is_available():
 
     end_time_gpu_wall = time.perf_counter()
     gpu_wall_time = end_time_gpu_wall - start_time_gpu_wall
-    print(f"GPU Wall clock time: {gpu_wall_time:.4f} seconds")
+    throughput = len(generated_tokens)/(gpu_wall_time)
+    print(f"GPU Wall clock time: {gpu_wall_time:.4f} seconds ")
+
+    print(f"Latency: {gpu_wall_time:.4f} s Throughput: {throughput:.4f} tokens/s")
 
     print("GPU Profiler Analysis (Top 5 Operators by Self CUDA Time):")
     print(prof_gpu.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+
+    # --- ROUGE evaluation ---
+
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    reference = dataset[0]["headline"]
+    s = scorer.score(reference, generated_headline)
+
+    print(f"ROUGE-1: {s['rouge1'].fmeasure:.4f}")
+    print(f"ROUGE-2: {s['rouge2'].fmeasure:.4f}")
+    print(f"ROUGE-L: {s['rougeL'].fmeasure:.4f}")
+
 else:
     print("\nCUDA not available on this system. Skipping GPU profiling.")
 
-# # 3. Architectural Optimization: KV Caching
-# 
-# **Your Task:** One of the most effective ways to speed up token generation is using a Key-Value (KV) cache. This avoids re-computing attention scores for tokens that are already part of the sequence. Enable the `use_cache` flag in the generation arguments and re-run the evaluation. Observe the impact on latency and throughput.
+# Baseline (no cache): set use_cache=False in generation_args
+gen_args_nocache = {"max_new_tokens": MAX_NEW_TOKENS, "use_cache": False}
+rows.append(benchmark_model(model, tokenizer, dataset, gen_args_nocache,
+                            n_samples=25, label="Baseline (No Cache)"))
+df = pd.DataFrame(rows)
+print(df.to_string(index=False))
 
-# %%
-# TODO: Evaluate the model with KV Caching enabled.
+
+# Evaluate the model with KV Caching enabled.
 
 generation_args = {
     "max_new_tokens": MAX_NEW_TOKENS,
@@ -279,21 +423,43 @@ if torch.cuda.is_available():
         profile_memory=False
     ) as prof_gpu:
         with torch.profiler.record_function("model_inference_gpu"):
-            generate_headline(model, tokenizer, dataset[0]["text"], generation_args)
+            generated_headline, generated_tokens =  generate_headline(model, tokenizer, dataset[0]["text"], generation_args)
 
     end_time_gpu_wall = time.perf_counter()
     gpu_wall_time = end_time_gpu_wall - start_time_gpu_wall
-    print(f"GPU Wall clock time: {gpu_wall_time:.4f} seconds")
+
+    throughput = len(generated_tokens)/(gpu_wall_time)
+    print(f"GPU Wall clock time: {gpu_wall_time:.4f} seconds ")
+
+    print(f"Latency: {gpu_wall_time:.4f} s Throughput: {throughput:.4f} tokens/s")
 
     print("GPU Profiler Analysis (Top 5 Operators by Self CUDA Time):")
     print(prof_gpu.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+
+    # --- ROUGE evaluation ---
+
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    reference = dataset[0]["headline"]
+    s = scorer.score(reference, generated_headline)
+
+    print(f"ROUGE-1: {s['rouge1'].fmeasure:.4f}")
+    print(f"ROUGE-2: {s['rouge2'].fmeasure:.4f}")
+    print(f"ROUGE-L: {s['rougeL'].fmeasure:.4f}")
+
+    print("\nGPU Profiler Analysis (Top 5 Operators by Self CUDA Time):")
+    print(prof_gpu.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+
 else:
     print("\nCUDA not available on this system. Skipping GPU profiling.")
 
-# # 4. Model Compression: Pruning
-# 
-# **Your Task:** Pruning removes redundant model weights, which can reduce model size and potentially speed up inference. Here, you will implement unstructured, magnitude-based pruning by creating a function that applies it to the model's linear layers and then evaluating the result.
+# KV caching: same model, use_cache=True
+gen_args_cache = {"max_new_tokens": MAX_NEW_TOKENS, "use_cache": True}
+rows.append(benchmark_model(model, tokenizer, dataset, gen_args_cache,
+                            n_samples=25, label="KV Caching"))
+df = pd.DataFrame(rows)
+print(df.to_string(index=False))    
 
+# TODO: Evaluate the model with pruning.
 
 def prune_model_weights(model, amount=0.01):
     if not 0 <= amount <= 1:
@@ -305,6 +471,7 @@ def prune_model_weights(model, amount=0.01):
             pruned_layers += 1
             prune.l1_unstructured(module, name="weight", amount=amount)
             prune.remove(module, "weight")
+            break
 
     print(f"Pruned {pruned_layers} linear layer(s)")
     return model
@@ -332,8 +499,19 @@ def run_performance_test(model, tokenizer, prompt, max_tokens, num_runs):
                 #sample_output = tokenizer.decode(generated_headline, skip_special_tokens=True)
                 sample_output = generated_headline
     avg_time = total_time / num_runs
-    return avg_time, sample_output, total_tokens
 
+    # --- ROUGE on the sample output ---
+    rouge_scores = None
+    if reference is not None:
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        s = scorer.score(reference, sample_output)
+        rouge_scores = {
+            "rouge1": s["rouge1"].fmeasure,
+            "rouge2": s["rouge2"].fmeasure,
+            "rougeL": s["rougeL"].fmeasure,
+        }
+
+    return avg_time, sample_output, total_tokens, rouge_scores
 
 print("CUDA available:", torch.cuda.is_available())
 print("CUDA device count:", torch.cuda.device_count())
@@ -368,8 +546,16 @@ NUM_SPEED_RUNS = 3
 free_mem, total_mem = torch.cuda.mem_get_info()
 print(f"After load - Free GPU memory: {free_mem/1e9:.2f} GB / {total_mem/1e9:.2f} GB")
 
-avg_time, output, total_tokens = run_performance_test(pruned_model, tokenizer, dataset[0]["text"], MAX_NEW_TOKENS, NUM_SPEED_RUNS)
+avg_time, output, total_tokens, rouge_scores = run_performance_test(pruned_model, tokenizer, dataset[0]["text"], MAX_NEW_TOKENS, NUM_SPEED_RUNS)
 
+throughput = total_tokens/(avg_time)
+print(f"Avg. Latency: {avg_time:.4f} s  Throughput: {throughput:.4f} tokens/s (over {NUM_SPEED_RUNS} runs)")
+print(f"Result:\n  - Avg Time: {avg_time:.4f}s\n  - Output: '{output}'\n  - Throughput: {throughput:.4f} tok/s")
+if rouge_scores:
+    print(f"  - ROUGE-1: {rouge_scores['rouge1']:.4f}")
+    print(f"  - ROUGE-2: {rouge_scores['rouge2']:.4f}")
+    print(f"  - ROUGE-L: {rouge_scores['rougeL']:.4f}")
+print(f"Avg. Latency: {avg_time:.4f} s Throughput: {throughput: .4f} s (over {NUM_SPEED_RUNS} runs)")
 #Log results
 #results_log.append({
 #        "Configuration": config_name,
@@ -377,7 +563,14 @@ avg_time, output, total_tokens = run_performance_test(pruned_model, tokenizer, d
 #        "Generated Output": output
 #    })
     
-print(f"Result:\n  - Avg Time: {avg_time:.4f}s\n  - Output: '{output}'s\n  - Total Tokens: {total_tokens:.4f}")
+print(f"Result:\n  - Avg Time: {avg_time:.4f}s\n  - Output: '{output}'s\n  - throughput: {throughput:.4f}")
+
+# Pruned model
+rows.append(benchmark_model(pruned_model, tokenizer, dataset, gen_args_cache,
+                            n_samples=25, label="Pruning (30%)"))
+
+df = pd.DataFrame(rows)
+print(df.to_string(index=False))
 
 # Clean up to save memory
 #del pruned_model
@@ -385,10 +578,6 @@ gc.collect()
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
-
-# # 5. Model Compression: Quantization
-# 
-#:** Quantization reduces the precision of model weights (e.g., from 16-bit to 4-bit), significantly cutting down memory usage and often speeding up inference. You will define a 4-bit quantization configuration and use it to load and evaluate a new model.
 
 # TODO: Implement and evaluate 4-bit quantization.
 
@@ -398,11 +587,8 @@ quant_config = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.float16
 )
 
-model_4bit = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    device_map = "auto",
-    quantization_config=quant_config
-)
+
+tokenizer_4bit, model_4bit = load_model(MODEL_NAME, quantization_config=quant_config, device_map="auto")
 
 memory_mb_4bit = get_model_memory_footprint(model_4bit)
 print(f"4-bit Memory Footprint: {memory_mb_4bit:.2f} MB")
@@ -410,14 +596,23 @@ print(f"4-bit Memory Footprint: {memory_mb_4bit:.2f} MB")
 model_4bit.eval()
 latencies_4bit = []
 
-avg_time, output, total_tokens = run_performance_test(model_4bit, tokenizer, dataset[0]["text"], MAX_NEW_TOKENS, NUM_SPEED_RUNS)
+avg_time, output, total_tokens, rouge_scores = run_performance_test(model_4bit, tokenizer, dataset[0]["text"], MAX_NEW_TOKENS, NUM_SPEED_RUNS)
 
 throughput_4bit = total_tokens/(avg_time)
 
 print(f"4-bit Avg. Latency: {avg_time:.4f} s 4-bit Throughput: {throughput_4bit:.4f} s (over {NUM_SPEED_RUNS} runs)")
-
+if rouge_scores:
+    print(f"  - ROUGE-1: {rouge_scores['rouge1']:.4f}")
+    print(f"  - ROUGE-2: {rouge_scores['rouge2']:.4f}")
+    print(f"  - ROUGE-L: {rouge_scores['rougeL']:.4f}")
 print(output)
 
+# Quantized model
+rows.append(benchmark_model(model_4bit, tokenizer, dataset, gen_args_cache,
+                            n_samples=25, label="Quantization (4-bit)"))
+
+df = pd.DataFrame(rows)
+print(df.to_string(index=False))
 
 
 
@@ -522,7 +717,11 @@ def run_speculative_decoding(draft_model, target_model, tokenizer, prompt_text, 
 
     total_accepted = input_ids.shape[1] - prompt_len
     avg_accepted_per_pass = total_accepted / target_passes if target_passes > 0 else 0
-    return end_time - start_time, target_passes, avg_accepted_per_pass
+
+        # Decode only the generated portion (exclude the prompt)
+    generated_text = tokenizer.decode(input_ids[0, prompt_len:], skip_special_tokens=True)
+
+    return end_time - start_time, target_passes, avg_accepted_per_pass, generated_text
 
 #DRAFT_MODEL_NAME = "/voc/shared/models/llama/Llama-3.2-1B"
 #TARGET_MODEL_NAME = "/voc/shared/models/llama/Llama-3.2-3B"
@@ -534,6 +733,37 @@ MAX_TOTAL_TOKENS = 50
 K_VALUES_TO_TEST = [1, 2, 3, 4, 5, 8, 10]
 spec_device = "cuda" if torch.cuda.is_available() else "cpu"
 spec_dtype = torch.float16 if spec_device == "cuda" else torch.float32
+
+def benchmark_spec_decoding(draft_model, target_model, tokenizer, dataset,
+                            max_tokens, k, n_samples=25, label="Speculative Decoding"):
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    times, tok_counts, r1, r2, rl = [], [], [], [], []
+    n = min(n_samples, len(dataset))
+
+    for i in range(n):
+        prompt    = dataset[i]["text"][:500]   # same truncation you used before
+        reference = dataset[i]["headline"]
+
+        spec_time, passes, avg_acc, gen_text = run_speculative_decoding(
+            draft_model, target_model, tokenizer, prompt, max_tokens, k
+        )
+        times.append(spec_time)
+        tok_counts.append(len(tokenizer.encode(gen_text)))
+
+        s = scorer.score(reference, gen_text)
+        r1.append(s["rouge1"].fmeasure)
+        r2.append(s["rouge2"].fmeasure)
+        rl.append(s["rougeL"].fmeasure)
+
+    return {
+        "Technique": label,
+        "Mean Latency (s)": round(np.mean(times), 4),
+        "Throughput (tok/s)": round(np.sum(tok_counts) / np.sum(times), 4),
+        "ROUGE-1": round(np.mean(r1), 4),
+        "ROUGE-2": round(np.mean(r2), 4),
+        "ROUGE-L": round(np.mean(rl), 4),
+        "N": n,
+    }
 
 # --- Load Target ---
 print(f"Loading Target Model: {TARGET_MODEL_NAME} on {spec_device} ({spec_dtype})...")
@@ -571,21 +801,27 @@ draft_model.eval()
 
 # --- Prompt (truncated to avoid long-doc OOM) ---
 PROMPT_TEXT = dataset[0]["text"][:500]
+REFERENCE = dataset[0]["headline"]
+scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
 
 # --- Run experiment ---
 results_log = []
 print("--- Running Speculative Decoding Experiment ---")
 for k in K_VALUES_TO_TEST:
     print(f"Testing with K = {k}...")
-    spec_time, spec_passes, avg_accepted = run_speculative_decoding(
+    spec_time, spec_passes, avg_accepted, gen_text = run_speculative_decoding(
         draft_model, target_model, target_tokenizer,   # FIX: correct tokenizer
         PROMPT_TEXT, MAX_TOTAL_TOKENS, k
     )
+    s = scorer.score(REFERENCE, gen_text)
     results_log.append({
         "K": k,
         "Time (s)": spec_time,
         "Target Passes": spec_passes,
         "Avg. Accepted Tokens": avg_accepted,
+        "ROUGE-1": s["rouge1"].fmeasure,
+        "ROUGE-2": s["rouge2"].fmeasure,
+        "ROUGE-L": s["rougeL"].fmeasure,
     })
     gc.collect()
     if torch.cuda.is_available():
@@ -594,3 +830,11 @@ for k in K_VALUES_TO_TEST:
 df_results = pd.DataFrame(results_log)
 print("--- Speculative Decoding Experiment Results Summary ---")
 print(df_results.to_string())
+
+rows.append(benchmark_spec_decoding(
+    draft_model, target_model, target_tokenizer, dataset,
+    max_tokens=MAX_TOTAL_TOKENS, k=3, n_samples=25,
+    label="Speculative Decoding (K=3)"
+))
+df = pd.DataFrame(rows)
+print(df.to_string(index=False))
