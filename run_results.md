@@ -210,3 +210,46 @@ means generation hits the MAX_TOTAL_TOKENS=50 cap or EOS before the larger
 K budget is fully used — the extra draft headroom is unused, so K=10 just
 costs slightly more draft time (1.55s → 1.84s) for no benefit.
 
+Below is the latest run (The obove ones are prev without Rouge scoring) 
+
+
+       Baseline (No Cache)           20.1772              0.9278   0.1650   0.0376   0.1356 25
+                KV Caching            4.5202              3.6282   0.1896   0.0468   0.1643 25
+             Pruning (30%)            4.8016              3.6654   0.1852   0.0343   0.1523 25
+      Quantization (4-bit)            0.6360             28.1144   0.1639   0.0324   0.1403 25
+Speculative Decoding (K=3)            1.4708             34.6483   0.0929   0.0032   0.0776 25
+
+quantization is the recommended optimization strategy, ideally
+combined with KV caching (which any standard generation pipeline
+enables by default).
+
+Performance: It provides the best latency and throughput of any
+technique tested, by a wide margin, which directly improves userfacing
+responsiveness and the number of requests a single GPU can
+serve.
+
+Cost: The ~80% memory reduction means the model fits on smaller,
+cheaper GPUs and more model replicas fit per device, lowering
+serving cost per request.
+
+Complexity: Quantization is straightforward to apply through the
+bitsandbytes integration in Transformers, requiring only a
+configuration change at load time rather than custom infrastructure.
+
+
+Quality: The numerical perturbation from 4-bit quantization has a
+modest effect on output quality, an acceptable trade for the large
+efficiency gains in a headline generation use case.
+
+
+Speculative decoding is a promising complementary technique for
+further latency reduction, but to be useful here it should be re-run
+with a matched model family (for example, a Llama-3.2-1B draft model
+paired with the Llama-3.2-3B target) so that it operates on the actual
+task model and produces comparable, meaningful results. Tensor and
+pipeline parallelism were not implemented in this single-GPU setup;
+they become relevant only when the model is too large for one device
+or when scaling across multiple GPUs.
+
+
+
