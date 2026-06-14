@@ -15,146 +15,94 @@ device 0: Tesla T4
 
 #step 3 Checking on Baseline Performance
 
-eos_token_id: 128001
-pad_token_id: 128001
-dataset has been loaded
-4-bit Memory Footprint: 4714.26 MB
-
---- Profiling on GPU ---
-Performing GPU warm-up run...
-{'headline': 'Over 4 Million Americans Roll Up Sleeves For Omicron-Targeted COVID Boosters', 'text': 'Health experts said it is too early to predict whether demand would match up with the 171 million doses of the new boosters the U.S. ordered for the fall.'}
-allocated GB: 0.0
-reserved GB: 0.0
-Entered generate_headline
-Tokenization done
-Moved inputs to device
-{'input_ids': torch.Size([1, 65]), 'attention_mask': torch.Size([1, 65])}
-About to call model.generate
-Starting from v4.46, the `logits` model output will have the same type as the model (except at train time, where it will always be FP32)
-model.generate finished
-Warm-up complete.
-Running inference on GPU and capturing profile...
-Entered generate_headline
-Tokenization done
-Moved inputs to device
-{'input_ids': torch.Size([1, 65]), 'attention_mask': torch.Size([1, 65])}
-About to call model.generate
-model.generate finished
-GPU Wall clock time: 26.3895 seconds
+GPU Wall clock time: 22.7579 seconds 
+Latency: 22.7579 s Throughput: 0.5712 tokens/s
 GPU Profiler Analysis (Top 5 Operators by Self CUDA Time):
 -----------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
                          Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls  
 -----------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
-          model_inference_gpu         1.73%     449.020ms        99.18%       25.714s       25.714s             1  
-                  aten::empty         0.02%       4.798ms         0.02%       4.798ms       3.673us          1306  
-                     aten::to         0.03%       6.809ms         0.13%      33.711ms       7.004us          4813  
-             aten::lift_fresh         0.00%      16.180us         0.00%      16.180us       0.647us            25  
-                aten::detach_         0.00%       9.800us         0.00%      16.625us       3.325us             5  
-                      detach_         0.00%       6.825us         0.00%       6.825us       1.365us             5  
-              aten::unsqueeze         0.03%       6.902ms         0.03%       8.974ms       6.059us          1481  
-             aten::as_strided         0.09%      24.599ms         0.09%      24.599ms       1.727us         14245  
-                   aten::isin         0.00%     345.516us         0.00%     414.100us      19.719us            21  
-                  aten::fill_         0.01%       3.043ms         0.01%       3.140ms       3.639us           863  
------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 25.926s
+          model_inference_gpu         1.32%     293.930ms        98.50%       22.011s       22.011s             1  
+                  aten::empty         0.02%       4.419ms         0.02%       4.419ms       3.186us          1387  
+                     aten::to         0.02%       5.306ms         0.11%      24.859ms       5.165us          4813  
+             aten::lift_fresh         0.00%      17.870us         0.00%      17.870us       0.397us            45  
+                aten::detach_         0.00%      41.985us         0.00%      80.584us       3.223us            25  
+                      detach_         0.00%      38.599us         0.00%      38.599us       1.544us            25  
+              aten::unsqueeze         0.03%       5.910ms         0.03%       7.698ms       4.691us          1641  
+             aten::as_strided         0.06%      13.748ms         0.06%      13.748ms       1.309us         10503  
+                   aten::isin         0.00%     271.052us         0.00%     327.049us      15.574us            21  
+                  aten::fill_         0.01%       2.329ms         0.01%       2.399ms       2.783us           862  
+-----------------------------  ------------  ------------  ------------  ------------  ------------  ------------ 
+          Technique  Mean Latency (s)  Throughput (tok/s)  ROUGE-1  ROUGE-2  ROUGE-L  N  Memory Footprint (MB)
+Baseline (No Cache)           17.9635              0.9508   0.1913   0.0533   0.1639 25                4714.26
+
 
 
 #step 4 KV Caching Enabled
 
---- Profiling on GPU ---
-Performing GPU warm-up run...
-{'headline': 'Over 4 Million Americans Roll Up Sleeves For Omicron-Targeted COVID Boosters', 'text': 'Health experts said it is too early to predict whether demand would match up with the 171 million doses of the new boosters the U.S. ordered for the fall.'}
-Entered generate_headline
-Tokenization done
-Moved inputs to device
-{'input_ids': torch.Size([1, 65]), 'attention_mask': torch.Size([1, 65])}
-About to call model.generate
-model.generate finished
-Warm-up complete.
-Running inference on GPU and capturing profile...
-Entered generate_headline
-Tokenization done
-Moved inputs to device
-{'input_ids': torch.Size([1, 65]), 'attention_mask': torch.Size([1, 65])}
-About to call model.generate
-model.generate finished
-GPU Wall clock time: 3.6024 seconds
+GPU Wall clock time: 6.1045 seconds 
+Latency: 6.1045 s Throughput: 3.2763 tokens/s
 GPU Profiler Analysis (Top 5 Operators by Self CUDA Time):
 -----------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
                          Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls  
 -----------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
-          model_inference_gpu         4.84%     164.039ms       100.00%        3.392s        3.392s             1  
-                  aten::empty         0.04%       1.408ms         0.04%       1.408ms       2.751us           512  
-...
-                  aten::fill_         0.01%     490.809us         0.02%     530.810us       1.226us           433  
+          model_inference_gpu         5.75%     331.847ms        99.99%        5.772s        5.772s             1  
+                  aten::empty         0.06%       3.694ms         0.06%       3.694ms       3.257us          1134  
+                     aten::to         0.11%       6.201ms         0.50%      28.625ms       5.908us          4845  
+             aten::lift_fresh         0.00%      33.251us         0.00%      33.251us       0.432us            77  
+                aten::detach_         0.00%      90.584us         0.00%     174.786us       3.066us            57  
+                      detach_         0.00%      84.202us         0.00%      84.202us       1.477us            57  
+              aten::unsqueeze         0.12%       7.210ms         0.16%       9.314ms       5.676us          1641  
+             aten::as_strided         0.31%      17.902ms         0.31%      17.902ms       1.521us         11771  
+                   aten::isin         0.01%     317.118us         0.01%     387.541us      18.454us            21  
+                  aten::fill_         0.02%       1.132ms         0.02%       1.218ms       1.413us           862  
 -----------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 3.392s
+Self CPU time total: 5.773s
+
+model.generate finished
+          Technique  Mean Latency (s)  Throughput (tok/s)  ROUGE-1  ROUGE-2  ROUGE-L  N  Memory Footprint (MB)
+Baseline (No Cache)           17.9635              0.9508   0.1913   0.0533   0.1639 25                4714.26
+         KV Caching            4.5161              3.5783   0.1563   0.0360   0.1366 25                4714.26
+
 
 #step 5 Applying Pruning and compressing the model
 
-CUDA available: True
-CUDA device count: 1
-Tesla T4
-Free GPU memory: 15.52 GB / 15.64 GB
-Pruning first linear layer only
-After load - Free GPU memory: 15.52 GB / 15.64 GB
-After load - Free GPU memory: 15.52 GB / 15.64 GB
-Entered generate_headline
-Tokenization done
-Moved inputs to device
-{'input_ids': torch.Size([1, 65]), 'attention_mask': torch.Size([1, 65])}
-About to call model.generate
+
 model.generate finished
-Entered generate_headline
-Tokenization done
-Moved inputs to device
-{'input_ids': torch.Size([1, 65]), 'attention_mask': torch.Size([1, 65])}
-About to call model.generate
-model.generate finished
-Entered generate_headline
-Tokenization done
-Moved inputs to device
-{'input_ids': torch.Size([1, 65]), 'attention_mask': torch.Size([1, 65])}
-About to call model.generate
-model.generate finished
-Result:
-  - Avg Time: 5.4826s
-  - Output: 'Doses of new COVID boosters will be needed to match demand for the fall's
-  - Total Tokens: 56.0000
+          Technique  Mean Latency (s)  Throughput (tok/s)  ROUGE-1  ROUGE-2  ROUGE-L  N  Memory Footprint (MB)
+Baseline (No Cache)           17.9635              0.9508   0.1913   0.0533   0.1639 25                4714.26
+         KV Caching            4.5161              3.5783   0.1563   0.0360   0.1366 25                4714.26
+      Pruning (30%)            4.7792              3.7579   0.1821   0.0355   0.1591 25                4714.26
 
 #step 6 Applying Quantization
 
-`low_cpu_mem_usage` was None, now set to True since model is quantized.
-4-bit Memory Footprint: 965.13 MB
-Entered generate_headline
-Tokenization done
-Moved inputs to device
-{'input_ids': torch.Size([1, 65]), 'attention_mask': torch.Size([1, 65])}
-About to call model.generate
 model.generate finished
-Entered generate_headline
-Tokenization done
-Moved inputs to device
-{'input_ids': torch.Size([1, 65]), 'attention_mask': torch.Size([1, 65])}
-About to call model.generate
-model.generate finished
-Entered generate_headline
-Tokenization done
-Moved inputs to device
-{'input_ids': torch.Size([1, 65]), 'attention_mask': torch.Size([1, 65])}
-About to call model.generate
-model.generate finished
-4-bit Avg. Latency: 0.8381 s 4-bit Throughput: 71.5913 s (over 3 runs)
-Demand for COVID-19 vaccines likely to exceed supply
-
-Commentary:
-The demand for COVID-19
+           Technique  Mean Latency (s)  Throughput (tok/s)  ROUGE-1  ROUGE-2  ROUGE-L  N  Memory Footprint (MB)
+ Baseline (No Cache)           17.9635              0.9508   0.1913   0.0533   0.1639 25                4714.26
+          KV Caching            4.5161              3.5783   0.1563   0.0360   0.1366 25                4714.26
+       Pruning (30%)            4.7792              3.7579   0.1821   0.0355   0.1591 25                4714.26
+Quantization (4-bit)            0.5927             29.9651   0.1422   0.0290   0.1289 25                1466.26
 
 
+#step 6 Tensor and Pipeline parallelism and Deepspeed Inference
+
+Single-GPU environment detected.Tensor and Pipeline parallelism will be performed on a Single GPU.
+Model has 16 layers, split into 2 pipeline stages:
+  Stage 0: layers 0–7 (8 layers)
+  Stage 1: layers 8–15 (8 layers)
+{'strategy': 'Pipeline Parallel (simulated, 2 stages)', 'latency_s': 1.5903, 'throughput_tok_s': 31.4401, 'stages': 2, 'layers_per_stage': 8, 'total_memory_mb': 1537.48, 'memory_per_device_mb': 768.74}
+TP shard check (float layer): max err 0.00e+00 (PASS)
+{'strategy': 'Tensor Parallel (simulated, 2 shards)', 'latency_s': 1.5265, 'throughput_tok_s': 32.7555, 'shards': 2, 'shard_correctness': 'PASS'}
 
 
-
-Self CPU time total: 25.926s
+                        Technique  Mean Latency (s)  Throughput (tok/s)  ROUGE-1  ROUGE-2  ROUGE-L  N  Memory Footprint (MB)
+              Baseline (No Cache)           17.9635              0.9508   0.1913   0.0533   0.1639 25                4714.26
+                       KV Caching            4.5161              3.5783   0.1563   0.0360   0.1366 25                4714.26
+                    Pruning (30%)            4.7792              3.7579   0.1821   0.0355   0.1591 25                4714.26
+             Quantization (4-bit)            0.5927             29.9651   0.1422   0.0290   0.1289 25                1466.26
+Pipeline Parallel (sim, 2 stages)            1.5903             31.4401      NaN      NaN      NaN  1                 768.74
+  Tensor Parallel (sim, 2 shards)            1.5265             32.7555      NaN      NaN      NaN  1                2471.63
+       Speculative Decoding (K=3)            1.2927             39.4224   0.0929   0.0032   0.0776 25                 914.12
+              DeepSpeed Inference            1.4676             34.0685      NaN      NaN      NaN 25                2471.63
 
 
 
@@ -166,17 +114,6 @@ decoding). As K grows, target passes drop and avg accepted tokens climb,
 which is exactly the win: fewer expensive target forward passes because
 the cheap draft model is correctly predicting multiple tokens at a time.
 
-
-
-Loading Target Model: gpt2-medium on cuda (torch.float16)...
-Loading weights: 100%
- 292/292 [00:03<00:00, 126.02it/s]
-Loading Draft Model: gpt2 on cuda (torch.float16)...
-Loading weights: 100%
- 148/148 [00:01<00:00, 198.35it/s]
-[transformers] 
-
-
 --- Running Speculative Decoding Experiment ---
 Testing with K = 1...
 Testing with K = 2...
@@ -184,20 +121,16 @@ Testing with K = 3...
 Testing with K = 4...
 Testing with K = 5...
 Testing with K = 8...
-Testing with K = 10
-
-
+Testing with K = 10...
 --- Speculative Decoding Experiment Results Summary ---
-
-| K | Time (s) | Target Passes | Avg. Accepted Tokens | Speedup vs K=1 | Target Pass Reduction vs K=1 |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 2.788328 | 50 | 1.000000 | 1.00x | 0.00% |
-| 2 | 1.565935 | 27 | 1.851852 | 1.78x | 46.00% |
-| 3 | 1.260171 | 19 | 2.631579 | 2.21x | 62.00% |
-| 4 | 1.356594 | 17 | 3.058824 | 2.06x | 66.00% |
-| 5 | 1.462748 | 16 | 3.250000 | 1.91x | 68.00% |
-| 8 | 1.549432 | 12 | 4.333333 | 1.80x | 76.00% |
-| 10 | 1.844262 | 12 | 4.333333 | 1.51x | 76.00% |
+    K  Time (s)  Target Passes  Avg. Accepted Tokens  ROUGE-1  ROUGE-2  ROUGE-L
+0   1  2.447822             50              1.000000      0.0      0.0      0.0
+1   2  1.739964             27              1.851852      0.0      0.0      0.0
+2   3  1.524414             19              2.631579      0.0      0.0      0.0
+3   4  1.681761             17              3.058824      0.0      0.0      0.0
+4   5  1.465034             16              3.250000      0.0      0.0      0.0
+5   8  1.545817             12              4.333333      0.0      0.0      0.0
+6  10  1.801511             12              4.333333      0.0      0.0      0.0
 
 Sweet spot: K=3 at 1.26s — the fastest of the batch. After that, time
 creeps back up even though passes keep falling. Classic spec-decoding
@@ -213,43 +146,44 @@ costs slightly more draft time (1.55s → 1.84s) for no benefit.
 Below is the latest run (The obove ones are prev without Rouge scoring) 
 
 
-       Baseline (No Cache)           20.1772              0.9278   0.1650   0.0376   0.1356 25
-                KV Caching            4.5202              3.6282   0.1896   0.0468   0.1643 25
-             Pruning (30%)            4.8016              3.6654   0.1852   0.0343   0.1523 25
-      Quantization (4-bit)            0.6360             28.1144   0.1639   0.0324   0.1403 25
-Speculative Decoding (K=3)            1.4708             34.6483   0.0929   0.0032   0.0776 25
+                        Technique  Mean Latency (s)  Throughput (tok/s)  ROUGE-1  ROUGE-2  ROUGE-L  N  Memory Footprint (MB)
+              Baseline (No Cache)           17.9635              0.9508   0.1913   0.0533   0.1639 25                4714.26
+                       KV Caching            4.5161              3.5783   0.1563   0.0360   0.1366 25                4714.26
+                    Pruning (30%)            4.7792              3.7579   0.1821   0.0355   0.1591 25                4714.26
+             Quantization (4-bit)            0.5927             29.9651   0.1422   0.0290   0.1289 25                1466.26
+Pipeline Parallel (sim, 2 stages)            1.5903             31.4401      NaN      NaN      NaN  1                 768.74
+  Tensor Parallel (sim, 2 shards)            1.5265             32.7555      NaN      NaN      NaN  1                2471.63
+       Speculative Decoding (K=3)            1.2927             39.4224   0.0929   0.0032   0.0776 25                 914.12
+              DeepSpeed Inference            1.4676             34.0685      NaN      NaN      NaN 25                2471.63
 
-quantization is the recommended optimization strategy, ideally
-combined with KV caching (which any standard generation pipeline
-enables by default).
+Recommendation
+For deployment in a production environment at the news portal, 4-bit quantization is the
+recommended optimization strategy, ideally combined with KV caching (which any standard
+generation pipeline enables by default).
 
-Performance: It provides the best latency and throughput of any
-technique tested, by a wide margin, which directly improves userfacing
-responsiveness and the number of requests a single GPU can
-serve.
+Performance: It provides the best latency and throughput of any technique tested, by a wide
+margin, which directly improves user-facing responsiveness and the number of requests a
+single GPU can serve. 
 
-Cost: The ~80% memory reduction means the model fits on smaller,
-cheaper GPUs and more model replicas fit per device, lowering
-serving cost per request.
+Cost: The ~69% memory reduction means the model fits on smaller, cheaper GPUs and more
+model replicas fit per device, lowering serving cost per request.
+Complexity: Quantization is straightforward to apply through the bitsandbytes integration in
+Transformers, requiring only a configuration change at load time rather than custom
+infrastructure.
 
-Complexity: Quantization is straightforward to apply through the
-bitsandbytes integration in Transformers, requiring only a
-configuration change at load time rather than custom infrastructure.
+Quality: The numerical perturbation from 4-bit quantization has a modest effect on output
+quality, an acceptable trade for the large efficiency gains in a headline generation use case.
 
+Speculative decoding is a promising complementary technique for further latency reduction, but
+to be comparable here it should be re-run with a matched model family (a Llama-3.2-1B draft
+paired with the Llama-3.2-3B target) rather than gpt2, so it operates on the actual task model.
 
-Quality: The numerical perturbation from 4-bit quantization has a
-modest effect on output quality, an acceptable trade for the large
-efficiency gains in a headline generation use case.
+Pipeline and tensor parallelism, and DeepSpeed's tensor-parallel mode, become relevant only
+when the model is too large for one device or when scaling throughput across multiple GPUs —
+neither of which is the binding constraint for a 3B model that already fits on a single T4. For this
+specific workload, quantization plus KV caching is the pragmatic, well-supported production
+choice.
 
-
-Speculative decoding is a promising complementary technique for
-further latency reduction, but to be useful here it should be re-run
-with a matched model family (for example, a Llama-3.2-1B draft model
-paired with the Llama-3.2-3B target) so that it operates on the actual
-task model and produces comparable, meaningful results. Tensor and
-pipeline parallelism were not implemented in this single-GPU setup;
-they become relevant only when the model is too large for one device
-or when scaling across multiple GPUs.
 
 
 
